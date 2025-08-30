@@ -2,6 +2,7 @@ import * as aws from "@pulumi/aws";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as pulumi from "@pulumi/pulumi";
 
 const sg = new aws.ec2.SecurityGroup("student-sg", {
   description: "Allow SSH inbound",
@@ -58,11 +59,14 @@ const instanceProfile = new aws.iam.InstanceProfile("cw-agent-profile", {
   role: cwRole.name,
 });
 
-const logGroup = new aws.cloudwatch.LogGroup("student-logs", {
+const stack = pulumi.getStack();
+const logGroup = new aws.cloudwatch.LogGroup(`student-logs-${stack}`, {
   retentionInDays: 7,
 });
 
-const students = ["student1", "student2", "student3", "student4", "student5"];
+const config = new pulumi.Config();
+const students = config.requireObject<string[]>("students");
+console.log("students are", students[0]);
 
 const userData = logGroup.name.apply((name) => {
   let script = `#!/bin/bash
@@ -75,7 +79,11 @@ systemctl restart sshd
 # Install CloudWatch Agent
 yum install -y amazon-cloudwatch-agent
 
-# Create config in correct directory
+# Prepare log files with wide permissions
+touch /var/log/student-logs.log
+chmod 666 /var/log/student-logs.log  # everyone can read/write
+
+# CloudWatch Agent config: all logs to same stream
 mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
 cat <<EOF > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 {
@@ -85,6 +93,11 @@ cat <<EOF > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
         "collect_list": [
           {
             "file_path": "/var/log/cloud-init-output.log",
+            "log_group_name": "${name}",
+            "log_stream_name": "{instance_id}"
+          },
+          {
+            "file_path": "/var/log/student-logs.log",
             "log_group_name": "${name}",
             "log_stream_name": "{instance_id}"
           }
@@ -99,26 +112,29 @@ systemctl enable amazon-cloudwatch-agent
 systemctl restart amazon-cloudwatch-agent
 `;
 
-  // Append student creation
+  // Create students and redirect all output to shared log
   students.forEach((s) => {
     script += `
 id -u ${s} &>/dev/null || useradd -m -s /bin/bash ${s}
 echo "${s}:${s}" | chpasswd
-echo "Created user ${s}" >> /var/log/student-setup.log
+
+# Log all output (stdout + stderr) to shared log, but keep display in SSH
+echo 'exec > >(tee -a /var/log/student-logs.log) 2>&1' >> /home/${s}/.bashrc
+chown ${s}:${s} /home/${s}/.bashrc
 `;
   });
 
   return script;
 });
 
-const server = new aws.ec2.Instance("student-server", {
+const server = new aws.ec2.Instance(`students-${stack}`, {
   instanceType: "t2.micro",
   ami: ami.id,
   keyName: key.keyName,
   vpcSecurityGroupIds: [sg.id],
   iamInstanceProfile: instanceProfile.name,
   tags: {
-    Name: "student-server",
+    Name: `students-${stack}`,
   },
   userData: userData,
 });
